@@ -1,0 +1,948 @@
+package qupath.ext.signalfinder.ui;
+
+import com.google.gson.Gson;
+import java.util.Arrays;
+import javafx.application.Platform;
+import javafx.beans.binding.Bindings;
+import javafx.beans.binding.BooleanBinding;
+import javafx.beans.binding.ObjectBinding;
+import javafx.beans.binding.StringBinding;
+import javafx.beans.property.BooleanProperty;
+import javafx.beans.property.ObjectProperty;
+import javafx.beans.property.SimpleBooleanProperty;
+import javafx.beans.property.SimpleObjectProperty;
+import javafx.beans.property.StringProperty;
+import javafx.beans.value.ObservableValue;
+import javafx.collections.ListChangeListener;
+import javafx.concurrent.Worker;
+import javafx.fxml.FXML;
+import javafx.fxml.FXMLLoader;
+import javafx.scene.Cursor;
+import javafx.scene.control.Button;
+import javafx.scene.control.CheckBox;
+import javafx.scene.control.ChoiceBox;
+import javafx.scene.control.ComboBox;
+import javafx.scene.control.Control;
+import javafx.scene.control.Label;
+import javafx.scene.control.MenuItem;
+import javafx.scene.control.Spinner;
+import javafx.scene.control.SpinnerValueFactory;
+import javafx.scene.control.ToggleButton;
+import javafx.scene.control.Tooltip;
+import javafx.scene.input.MouseEvent;
+import javafx.scene.layout.BorderPane;
+import javafx.scene.web.WebView;
+import org.commonmark.renderer.html.HtmlRenderer;
+import org.controlsfx.control.CheckComboBox;
+import org.controlsfx.control.PopOver;
+import org.controlsfx.control.SearchableComboBox;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+//Instaseg specific lines dropped
+//import qupath.ext.instanseg.core.InstanSegModel;
+//import qupath.ext.instanseg.core.PytorchManager;
+import qupath.fx.dialogs.Dialogs;
+import qupath.fx.dialogs.FileChoosers;
+import qupath.fx.utils.FXUtils;
+import qupath.lib.common.ThreadTools;
+import qupath.lib.display.ChannelDisplayInfo;
+import qupath.lib.gui.QuPathGUI;
+import qupath.lib.gui.prefs.PathPrefs;
+import qupath.lib.gui.tools.GuiTools;
+import qupath.lib.gui.tools.WebViews;
+import qupath.lib.images.ImageData;
+import qupath.lib.objects.PathObjectTools;
+import qupath.lib.plugins.workflow.DefaultScriptableWorkflowStep;
+
+import java.awt.image.BufferedImage;
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.ResourceBundle;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.FutureTask;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+/**
+ * Controller for UI pane contained in instanseg_control.fxml
+ */
+public class SignalFinderController extends BorderPane {
+
+    private static final Logger logger = LoggerFactory.getLogger(InstanSegController.class);
+
+    private static final ResourceBundle resources = InstanSegResources.getResources();
+
+    @FXML
+    private CheckComboBox<InputChannelItem> comboInputChannels;
+    @FXML
+    private SearchableComboBox<InstanSegModel> modelChoiceBox;
+    @FXML
+    private Button runButton;
+    @FXML
+    private Button downloadButton;
+    @FXML
+    private Label labelMessage;
+    @FXML
+    private ChoiceBox<String> deviceChoices;
+    @FXML
+    private ChoiceBox<Integer> tileSizeChoiceBox;
+    @FXML
+    private ChoiceBox<Integer> tilePaddingChoiceBox;
+    @FXML
+    private Spinner<Integer> threadSpinner;
+    @FXML
+    private ToggleButton selectAllAnnotationsButton;
+    @FXML
+    private ToggleButton selectAllTMACoresButton;
+    @FXML
+    private CheckComboBox<OutputChannelItem> comboOutputChannels;
+    @FXML
+    private ComboBox<String> comboOutputType;
+    @FXML
+    private CheckBox makeMeasurementsCheckBox;
+    @FXML
+    private CheckBox randomColorsCheckBox;
+    @FXML
+    private Button infoButton;
+    @FXML
+    private Label modelDirLabel;
+    @FXML
+    private Label labelModelsLocation;
+    @FXML
+    private Tooltip tooltipModelDir;
+
+    private final Watcher watcher = Watcher.getInstance();
+
+    private final ExecutorService pool = Executors.newSingleThreadExecutor(ThreadTools.createThreadFactory("instanseg", true));
+    private final QuPathGUI qupath;
+    private final ObjectProperty<FutureTask<?>> pendingTask = new SimpleObjectProperty<>();
+    private final MessageTextHelper messageTextHelper;
+
+    private final BooleanProperty needsUpdating = new SimpleBooleanProperty();
+
+    private final ObjectProperty<InstanSegModel> selectedModel = new SimpleObjectProperty<>();
+    private final StringProperty lastSelectedModelPath = PathPrefs.createPersistentPreference("instanseg.lastSelectModel", null);
+    private final BooleanBinding selectedModelIsAvailable = InstanSegUtils.createModelDownloadedBinding(selectedModel, needsUpdating);
+
+    // Cache the checkbox status for input and output channels, so this can be restored when the selected model changes
+    private final CheckModelCache<String, InputChannelItem> inputChannelCache;
+    private final CheckModelCache<String, OutputChannelItem> outputChannelCache;
+
+    private static final ObjectBinding<Path> modelDirectoryBinding = InstanSegUtils.getModelDirectoryBinding();
+
+    private static final BooleanBinding isModelDirectoryValid = InstanSegUtils.isModelDirectoryValid(modelDirectoryBinding);
+
+    private List<InstanSegModel> remoteModels;
+
+    private final BooleanProperty requestingPyTorch = new SimpleBooleanProperty(false);
+
+    // Listener for property changes in the current ImageData; these can be required to update the input channels
+    private final PropertyChangeListener imageDataPropertyChangeListener = this::handleImageDataPropertyChange;
+
+    /**
+     * Create an instance of the InstanSeg GUI pane.
+     * @param qupath The QuPath GUI it should be attached to.
+     * @return A handle on the UI element.
+     * @throws IOException If the FXML or resources fail to load.
+     */
+    public static InstanSegController createInstance(QuPathGUI qupath) throws IOException {
+        return new InstanSegController(qupath);
+    }
+
+    private InstanSegController(QuPathGUI qupath) throws IOException {
+        this.qupath = qupath;
+        var url = InstanSegController.class.getResource("instanseg_control.fxml");
+        FXMLLoader loader = new FXMLLoader(url, resources);
+        loader.setRoot(this);
+        loader.setController(this);
+        loader.load();
+
+        // Create variables that depend upon the UI elements
+        messageTextHelper = new MessageTextHelper(modelChoiceBox, deviceChoices, comboInputChannels, needsUpdating);
+        StringBinding selectedModelName = Bindings.createStringBinding(() -> {
+            var model = selectedModel.get();
+            if (model != null && model.isValid())
+                return model.getName();
+            else
+                return null;
+        }, selectedModel, needsUpdating);
+        inputChannelCache = CheckModelCache.create(selectedModelName, comboInputChannels);
+        outputChannelCache = CheckModelCache.create(selectedModelName, comboOutputChannels);
+
+        // These items are ordered in the same way they appear in the UI,
+        // starting at the top
+
+        // Selecting a model
+        configureModelChoices();
+        configureDownloadButton();
+        configureInfoButton();
+
+        // Setting the model directory
+        configureDirectoryLabel();
+
+        // Select all buttons
+        configureSelectButtons();
+
+        // Run button
+        configureRunning();
+        configureRunMessageLabel();
+
+        // Options
+        configureTileSizes();
+        configureTilePadding();
+        configureDeviceChoices();
+        configureThreadSpinner();
+        configureInputChannelCombo();
+        configureOutputChannelCombo();
+        configureOutputTypeCombo();
+        configureDefaultValues();
+
+        // Fix tooltip issue with ControlsFX combo boxes
+        // Need to run later so that the CSS lookup can work
+        Platform.runLater(() -> {
+            fixComboBoxTooltip(modelChoiceBox);
+            fixComboBoxTooltip(comboInputChannels);
+            fixComboBoxTooltip(comboOutputChannels);
+        });
+    }
+
+    /**
+     * Workaround to enable tooltips for non-standard, ControlsFX combo boxes.
+     * Workaround for https://github.com/controlsfx/controlsfx/issues/1530
+     * @param combo a ControlsFX combo-box variation (e.g. searchable, or check combo box)
+     */
+    private static void fixComboBoxTooltip(Control combo) {
+        var tooltip = combo.getTooltip();
+        if (tooltip != null) {
+            for (var node : combo.lookupAll(".combo-box")) {
+                Tooltip.install(node, tooltip);
+            }
+        }
+    }
+
+    private void configureOutputTypeCombo() {
+        comboOutputType.getItems().addAll("Default", "Detections", "Annotations", "Cells");
+        comboOutputType.getSelectionModel().select(0);
+    }
+
+    private void refreshAvailableModels() {
+        if (remoteModels == null)
+            remoteModels = getRemoteModels();
+        var list = new ArrayList<InstanSegModel>();
+        var comparator = Comparator.comparing(InstanSegModel::toString);
+        var localModels = watcher.getModels()
+                .stream()
+                .sorted(comparator)
+                .toList();
+        // Need to use a loop and not a stream to avoid exceptions if there are duplicate names
+        Map<String, InstanSegModel> localModelNames = new TreeMap<>();
+        for (var model : localModels) {
+            if (localModelNames.put(model.getName(), model) != null) {
+                logger.warn("Duplicate model names aren't allowed! Dropping {}", model.getName());
+            }
+        }
+        var remoteAndNotLocal = remoteModels.stream()
+                .sorted(comparator)
+                .toList();
+        list.addAll(localModels);
+        list.addAll(remoteAndNotLocal);
+        // Update items & try our best to retain the current selection (based on name)
+        var currentSelection = modelChoiceBox.getSelectionModel().getSelectedItem();
+        modelChoiceBox.getItems().setAll(list);
+        if (list.isEmpty()) {
+            modelChoiceBox.getSelectionModel().clearSelection();
+        } else if (currentSelection == null) {
+            modelChoiceBox.getSelectionModel().selectFirst();
+        } else {
+            modelChoiceBox.getSelectionModel().select(
+                    list.stream()
+                            .filter(m -> m.getName().equals(currentSelection.getName()))
+                            .findFirst()
+                            .orElse(list.getFirst())
+            );
+        }
+    }
+
+    private void configureModelChoices() {
+        selectedModel.bind(modelChoiceBox.getSelectionModel().selectedItemProperty());
+        selectedModel.addListener((v, o, n) -> refreshModelChoice());
+        modelChoiceBox.setCellFactory(param -> new ModelListCell());
+        watcher.getModels().addListener((ListChangeListener<InstanSegModel>) c -> refreshAvailableModels());
+        refreshAvailableModels();
+        if (lastSelectedModelPath.get() != null) {
+            modelChoiceBox.getItems().stream()
+                    .filter(m -> m.getPath().orElse(Path.of("")).toString().equals(lastSelectedModelPath.get()))
+                    .findFirst()
+                    .ifPresent(instanSegModel -> modelChoiceBox.getSelectionModel().select(instanSegModel));
+        }
+        selectedModel.addListener((v, o, n) -> {
+            if (n != null) {
+                n.getPath().ifPresent(path -> lastSelectedModelPath.set(path.toString()));
+            }
+        });
+    }
+
+    private void configureInfoButton() {
+        infoButton.disableProperty().bind(selectedModelIsAvailable.not());
+        WebView webView = WebViews.create(true);
+        PopOver infoPopover = new PopOver(webView);
+        infoButton.setOnAction(e -> parseMarkdown(selectedModel.get(), webView, infoButton, infoPopover));
+    }
+
+    private void configureDownloadButton() {
+        downloadButton.disableProperty().bind(
+                selectedModelIsAvailable.or(
+                        selectedModel.isNull())
+        );
+        downloadButton.setOnAction(e -> downloadSelectedModelAsync());
+    }
+
+    private void configureOutputChannelCombo() {
+        // Quick way to match widths...
+        comboOutputChannels.prefWidthProperty().bind(comboInputChannels.widthProperty());
+        // Show a better title than the text of all selections
+        comboOutputChannels.getCheckModel().getCheckedItems().addListener(this::handleOutputChannelChange);
+        FXUtils.installSelectAllOrNoneMenu(comboOutputChannels);
+    }
+
+    private void handleOutputChannelChange(ListChangeListener.Change<? extends OutputChannelItem> change) {
+        var list = change.getList();
+        if (list.isEmpty() || list.size() == comboOutputChannels.getItems().size())
+            comboOutputChannels.setTitle("All available");
+        else if (list.size() == 1) {
+            comboOutputChannels.setTitle(list.getFirst().toString());
+        } else {
+            comboOutputChannels.setTitle(list.size() + " selected");
+        }
+    }
+
+    private void configureDefaultValues() {
+        makeMeasurementsCheckBox.selectedProperty().bindBidirectional(InstanSegPreferences.makeMeasurementsProperty());
+        randomColorsCheckBox.selectedProperty().bindBidirectional(InstanSegPreferences.randomColorsProperty());
+    }
+
+    /**
+     * Open the model directory in the system file browser when double-clicked.
+     */
+    @FXML
+    void handleModelDirectoryLabelClick(MouseEvent event) {
+        if (event.getClickCount() != 2) {
+            return;
+        }
+        var modelDir = InstanSegUtils.getModelDirectory().orElse(null);
+        if (modelDir == null) {
+            return;
+        }
+        if (Files.exists(modelDir)) {
+            GuiTools.browseDirectory(modelDir.toFile());
+        } else {
+            logger.debug("Can't browse directory for {}", modelDir);
+        }
+    }
+
+    @FXML
+    void promptForModelDirectory() {
+        promptToUpdateDirectory(InstanSegPreferences.modelDirectoryProperty());
+    }
+
+
+    private void configureInputChannelCombo() {
+        qupath.imageDataProperty().addListener(this::handleImageDataChange);
+        handleImageDataChange(qupath.imageDataProperty(), null, qupath.imageDataProperty().get());
+        comboInputChannels.setTitle(getCheckComboBoxText(comboInputChannels));
+        comboInputChannels.getItems().addListener((ListChangeListener<InputChannelItem>) c -> {
+            comboInputChannels.setTitle(getCheckComboBoxText(comboInputChannels));
+        });
+        comboInputChannels.getCheckModel().getCheckedItems().addListener((ListChangeListener<InputChannelItem>) c -> {
+            comboInputChannels.setTitle(getCheckComboBoxText(comboInputChannels));
+        });
+        FXUtils.installSelectAllOrNoneMenu(comboInputChannels);
+        addSetFromVisible(comboInputChannels);
+    }
+
+    private void handleImageDataChange(ObservableValue<? extends ImageData<BufferedImage>> values, ImageData<BufferedImage> oldValue, ImageData<BufferedImage> newValue) {
+        if (oldValue != null) {
+            oldValue.removePropertyChangeListener(imageDataPropertyChangeListener);
+        }
+        if (newValue != null) {
+            newValue.addPropertyChangeListener(imageDataPropertyChangeListener);
+        }
+        updateInputChannels(newValue);
+    }
+
+    private void handleImageDataPropertyChange(PropertyChangeEvent event) {
+        String name = event.getPropertyName();
+        if ("stains".equals(name) || "imageType".equals(name) || "serverMetadata".equals(name)) {
+            // Update the input channels when the stains or image type changes or the server metadata changes
+            updateInputChannels(qupath.getImageData());
+        }
+    }
+
+    private void updateInputChannels(ImageData<BufferedImage> imageData) {
+        if (imageData == null) {
+            return;
+        }
+        if (!Platform.isFxApplicationThread()) {
+            Platform.runLater(() -> updateInputChannels(imageData));
+            return;
+        }
+        // Store the checks without changing the current value
+        inputChannelCache.snapshotChecks();
+        // Update the items, if some are available to be checked
+        if (!comboInputChannels.getItems().isEmpty()) {
+            comboInputChannels.getCheckModel().clearChecks();
+        }
+        comboInputChannels.getItems().clear();
+        comboInputChannels.getItems().setAll(InputChannelItem.getAvailableChannels(imageData));
+        var model = selectedModel.get();
+        if (model != null && inputChannelCache.restoreChecks() && !comboInputChannels.getCheckModel().isEmpty()) {
+            // Return if we could store previously-saved checks - this will fail if the items have changed,
+            // of if there were no previous checks (e.g. because it's a new model)
+            return;
+        }
+        resetInputChecks(imageData, model);
+    }
+
+    /**
+     * Reset the checked input channels based on the current image and a model.
+     * If the number of channels in the image file matches the number in the model,
+     * or if we have an arbitrary channel model, then check all channels.
+     * Otherwise, check none.
+     * @param imageData the current image, used to query number of channels available
+     * @param model a model, used to check how many channels we handle
+     */
+    private void resetInputChecks(ImageData<BufferedImage> imageData, InstanSegModel model) {
+        if (model != null && model.isValid()) {
+            int nModelChannels = model.getNumChannels().orElse(InstanSegModel.ANY_CHANNELS);
+            comboInputChannels.getCheckModel().clearChecks();
+            if (nModelChannels == imageData.getServer().nChannels() || nModelChannels == InstanSegModel.ANY_CHANNELS) {
+                comboInputChannels.getCheckModel().checkIndices(IntStream.range(0, imageData.getServer().nChannels()).toArray());
+            }
+        }
+    }
+
+    private static String getCheckComboBoxText(CheckComboBox<InputChannelItem> comboBox) {
+        int n = comboBox.getCheckModel().getCheckedItems().stream()
+                .filter(Objects::nonNull)
+                .toList()
+                .size();
+        if (n == 0)
+            return resources.getString("ui.options.noChannelSelected");
+        if (n == 1)
+            return resources.getString("ui.options.oneChannelSelected");
+        return String.format(resources.getString("ui.options.nChannelSelected"), n);
+    }
+
+    /**
+     * Add an option to the ContextMenu of the CheckComboBox to select all
+     * currently-visible channels.
+     * <p>
+     * Particularly useful for images with many channels - it's possible
+     * to preview a subset of channels using the brightness and contrast
+     * window, and to then transfer this selection to InstanSeg by simply
+     * right-clicking and choosing "Set from visible".
+     * @param comboChannels The CheckComboBox for selecting channels.
+     */
+    private void addSetFromVisible(CheckComboBox<InputChannelItem> comboChannels) {
+        var mi = new MenuItem();
+        mi.setText("Set from visible");
+        mi.setOnAction(e -> {
+            comboChannels.getCheckModel().clearChecks();
+            var activeChannels = qupath.getViewer().getImageDisplay().selectedChannels();
+            var channelNames = activeChannels.stream()
+                    .map(ChannelDisplayInfo::getName)
+                    .toList();
+            if (qupath.getImageData() != null && !qupath.getImageData().getServer().isRGB()) {
+                channelNames = channelNames.stream()
+                        .map(s -> s.replaceAll(" \\(C\\d+\\)$", ""))
+                        .toList();
+            }
+            var comboItems = comboChannels.getItems();
+            for (int i = 0; i < comboItems.size(); i++) {
+                if (channelNames.contains(comboItems.get(i).getName())) {
+                    comboChannels.getCheckModel().check(i);
+                }
+            }
+        });
+        qupath.imageDataProperty().addListener((v, o, n) -> {
+            if (n == null) {
+                return;
+            }
+            mi.setDisable(n.getServer().isRGB());
+        });
+        if (qupath.getImageData() != null) {
+            mi.setDisable(qupath.getImageData().getServer().isRGB());
+        }
+        comboChannels.getContextMenu().getItems().add(mi);
+    }
+
+    private void configureThreadSpinner() {
+        SpinnerValueFactory.IntegerSpinnerValueFactory factory = (SpinnerValueFactory.IntegerSpinnerValueFactory) threadSpinner.getValueFactory();
+        factory.setMax(Runtime.getRuntime().availableProcessors());
+        threadSpinner.getValueFactory().valueProperty().bindBidirectional(InstanSegPreferences.numThreadsProperty().asObject());
+    }
+
+    private void configureRunning() {
+        runButton.disableProperty().bind(
+                qupath.imageDataProperty().isNull()
+                        .or(pendingTask.isNotNull()) // Don't allow multiple tasks to be started
+                        .or(messageTextHelper.hasWarning())
+                        .or(deviceChoices.getSelectionModel().selectedItemProperty().isNull()) // Can't run without a device
+                        .or(isModelDirectoryValid.not()) // Can't run or download without a model directory
+                        .or(selectedModel.isNull()) // Can't run without a model
+                        .or(requestingPyTorch)
+                        .or(Bindings.createBooleanBinding(() -> {
+                            var model = selectedModel.get();
+                            if (model == null) {
+                                return true;
+                            }
+                            var modelDir = InstanSegUtils.getModelDirectory().orElse(null);
+                            if (modelDir != null && !model.isValid()) {
+                                return false; // to enable "download and run"
+                            }
+                            return false;
+                        }, selectedModel, needsUpdating))
+        );
+        pendingTask.addListener((observable, oldValue, newValue) -> {
+            if (newValue != null) {
+                pool.execute(newValue);
+            }
+        });
+    }
+
+
+    /**
+     * Make UI changes based on the selected model.
+     * This may be called when the selected model is changed, or an existing model is downloaded.
+     */
+    private void refreshModelChoice() {
+        var modelDir = InstanSegUtils.getModelDirectory().orElse(null);
+        if (modelDir == null)
+            return;
+
+        var model = selectedModel.get();
+        if (model == null)
+            return;
+
+        try {
+            model.checkIfDownloaded(modelDir.resolve("downloaded"), false);
+        } catch (IOException e) {
+            logger.debug("Error checking zip or RDF file(s); this shouldn't happen", e);
+            Dialogs.showErrorNotification(resources.getString("title"), resources.getString("error.checkingModel"));
+        }
+        if (!model.isValid() || qupath.getImageData() == null) {
+            return;
+        }
+        int numChannels = model.getNumChannels().orElse(InstanSegModel.ANY_CHANNELS);
+        // Try to restore last used channels - but need to ensure this is valid for the model
+        var inputChannelsRestored = inputChannelCache.restoreChecks() && (numChannels == InstanSegModel.ANY_CHANNELS
+                || numChannels == comboInputChannels.getCheckModel().getItemCount());
+        // If we couldn't restore the channels, set as many as we need to be checked, assuming there are items to be checked
+        if (!inputChannelsRestored && comboInputChannels.getCheckModel().getItemCount() > 0) {
+            resetInputChecks(qupath.getImageData(), model);
+        }
+        // Handle output channels
+        var nOutputs = model.getOutputChannels().orElse(1);
+        comboOutputChannels.getCheckModel().clearChecks();
+        comboOutputChannels.getItems().setAll(OutputChannelItem.getOutputsForChannelCount(nOutputs));
+        if (!outputChannelCache.restoreChecks() || comboOutputChannels.getCheckModel().isEmpty()) {
+            comboOutputChannels.getCheckModel().checkAll();
+        }
+    }
+
+    /**
+     * Try to download the currently-selected model in another thread.
+     * @return A Future that is completed when the download finishes.
+     */
+    private CompletableFuture<InstanSegModel> downloadSelectedModelAsync() {
+        var model = selectedModel.get();
+        if (model == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return downloadModelAsync(model);
+    }
+
+    /**
+     * Try to download the specified model in another thread.
+     * @param model The model
+     * @return A future that is completed when the download finishes.
+     */
+    private CompletableFuture<InstanSegModel> downloadModelAsync(InstanSegModel model) {
+        var modelDir = InstanSegUtils.getModelDirectory().orElse(null);
+        if (modelDir == null || !Files.exists(modelDir)) {
+            Dialogs.showErrorMessage(resources.getString("title"),
+                    resources.getString("ui.model-directory.choose-prompt"));
+            return CompletableFuture.completedFuture(null);
+        }
+        return CompletableFuture.supplyAsync(() -> downloadModel(model, modelDir), ForkJoinPool.commonPool());
+    }
+
+    /**
+     * Try to download the specified model to the given directory in the current thread.
+     * @param model The model.
+     * @param modelDir The model directory.
+     * @return The downloaded model.
+     */
+    private InstanSegModel downloadModel(InstanSegModel model, Path modelDir) {
+        Objects.requireNonNull(modelDir);
+        Objects.requireNonNull(model);
+        try {
+            Dialogs.showInfoNotification(resources.getString("title"),
+                    String.format(resources.getString("ui.popup.fetching"), model.getName()));
+            model.checkIfDownloaded(modelDir.resolve("downloaded"), true);
+            Dialogs.showInfoNotification(resources.getString("title"),
+                    String.format(resources.getString("ui.popup.available"), model.getName()));
+            FXUtils.runOnApplicationThread(() -> {
+                needsUpdating.set(!needsUpdating.get());
+                refreshModelChoice();
+            });
+        } catch (IOException ex) {
+            Dialogs.showErrorNotification(resources.getString("title"), resources.getString("error.downloading"));
+            logger.error("Error download model", ex);
+        }
+        return model;
+    }
+
+    private static void parseMarkdown(InstanSegModel model, WebView webView, Button infoButton, PopOver infoPopover) {
+        Optional<String> readme = model.getREADME();
+        if (readme.isEmpty())
+            return;
+        String body = readme.get();
+
+        // Parse the initial markdown only, to extract any YAML front matter
+        var parser = org.commonmark.parser.Parser.builder().build();
+        var doc = parser.parse(body);
+
+        // If the markdown doesn't start with a title, pre-pending the model title & description (if available)
+        if (!body.startsWith("#")) {
+            String sb = "## " + model.getName() + "\n\n----\n\n";
+            doc.prependChild(parser.parse(sb));
+        }
+        webView.getEngine().loadContent(HtmlRenderer.builder().build().render(doc));
+        infoPopover.show(infoButton);
+    }
+
+    private static boolean promptToAllowOnlineModelCheck() {
+        String always = resources.getString("ui.model-online-check.always");
+        String never = resources.getString("ui.model-online-check.never");
+        String prompt = resources.getString("ui.model-online-check.allow-once");
+        var permit = Dialogs.builder()
+                .title(resources.getString("title"))
+                .contentText(resources.getString("ui.model-online-check.prompt"))
+                .buttons(always, never, prompt)
+                .showAndWait()
+                .orElse(null);
+        if (permit == null)
+            return false;
+        String text = permit.getText();
+        if (always.equals(text)) {
+            InstanSegPreferences.permitOnlineProperty().set(InstanSegPreferences.OnlinePermission.YES);
+            return true;
+        } else if (never.equals(text)) {
+            InstanSegPreferences.permitOnlineProperty().set(InstanSegPreferences.OnlinePermission.NO);
+            return false;
+        } else if (prompt.equals(text)) {
+            InstanSegPreferences.permitOnlineProperty().set(InstanSegPreferences.OnlinePermission.PROMPT);
+            return true;
+        } else {
+            logger.warn("Unknown choice: {}", text);
+            return false;
+        }
+    }
+
+    private static List<InstanSegModel> getRemoteModels() {
+        var permit = InstanSegPreferences.permitOnlineProperty().get();
+        if (permit == InstanSegPreferences.OnlinePermission.NO) {
+            logger.debug("Not allowed to check for models online.");
+            return List.of();
+        } else if (permit == InstanSegPreferences.OnlinePermission.PROMPT) {
+            if (!promptToAllowOnlineModelCheck()) {
+                logger.debug("User declined online model check.");
+                return List.of();
+            }
+        }
+        InputStream in = InstanSegController.class.getResourceAsStream("model-index.json");
+        assert in != null;
+        String cont = new BufferedReader(new InputStreamReader(in))
+                .lines()
+                .collect(Collectors.joining("\n"));
+        var gson = new Gson();
+        var remoteModels = gson.fromJson(cont, RemoteModel[].class);
+
+        List<InstanSegModel> models = new ArrayList<>();
+        for (var remoteModel: remoteModels) {
+            models.add(
+                    InstanSegModel.fromURL(
+                            remoteModel.getName(),
+                            remoteModel.getVersion(),
+                            remoteModel.getUrl()
+                    )
+            );
+        }
+        return List.copyOf(models);
+    }
+
+    private void configureTilePadding() {
+        tilePaddingChoiceBox.getItems().addAll(16, 32, 48, 64, 80, 96);
+        tilePaddingChoiceBox.setValue(InstanSegPreferences.tilePaddingProperty().getValue());
+        tilePaddingChoiceBox.valueProperty().addListener((v, o, n) -> InstanSegPreferences.tilePaddingProperty().set(n));
+    }
+
+
+    private void configureTileSizes() {
+        // The use of 32-bit signed ints for coordinates of the intermediate sparse matrix *might* be
+        // an issue for very large tile sizes - but I haven't seen any evidence of this.
+        // We definitely can't have very small tiles, because they must be greater than 2 x the padding.
+        tileSizeChoiceBox.getItems().addAll(256, 512, 1024, 2048);
+        tileSizeChoiceBox.setValue(InstanSegPreferences.tileSizeProperty().getValue());
+        tileSizeChoiceBox.valueProperty().addListener((v, o, n) -> InstanSegPreferences.tileSizeProperty().set(n));
+    }
+
+    private void configureSelectButtons() {
+        selectAllAnnotationsButton.disableProperty().bind(qupath.imageDataProperty().isNull());
+        selectAllTMACoresButton.disableProperty().bind(qupath.imageDataProperty().isNull());
+        overrideToggleSelected(selectAllAnnotationsButton);
+        overrideToggleSelected(selectAllTMACoresButton);
+    }
+
+    // Hack to prevent the toggle buttons from staying selected
+    // This allows us to use a segmented button with the appearance of regular, non-toggle buttons
+    private static void overrideToggleSelected(ToggleButton button) {
+        button.selectedProperty().addListener((value, oldValue, newValue) -> button.setSelected(false));
+    }
+
+    private void configureDeviceChoices() {
+        deviceChoices.disableProperty().bind(Bindings.size(deviceChoices.getItems()).isEqualTo(0));
+        updateAvailableDevices();
+        // Don't bind property for now, since this would cause trouble if the InstanSegPreferences.preferredDeviceProperty() is
+        // changed elsewhere
+        deviceChoices.getSelectionModel().selectedItemProperty().addListener(
+                (value, oldValue, newValue) -> InstanSegPreferences.preferredDeviceProperty().set(newValue));
+    }
+
+    private void updateAvailableDevices() {
+        // Update the available devices if these have changed
+        var available = Set.copyOf(PytorchManager.getAvailableDevices());
+        var items = Set.copyOf(deviceChoices.getItems());
+        var selected = deviceChoices.getSelectionModel().getSelectedItem();
+        if (!available.equals(items)) {
+            deviceChoices.getItems().setAll(available);
+        }
+        // Try to ensure we have something selected - without making unnecessary changes
+        if (selected == null) {
+            selected = InstanSegPreferences.preferredDeviceProperty().get();
+        } else if (Objects.equals(selected, deviceChoices.getSelectionModel().getSelectedItem())) {
+            return;
+        }
+        if (available.contains(selected)) {
+            deviceChoices.getSelectionModel().select(selected);
+        } else if (!available.isEmpty()) {
+            deviceChoices.getSelectionModel().selectFirst();
+        }
+    }
+
+    private void configureRunMessageLabel() {
+        labelMessage.textProperty().bind(messageTextHelper.messageLabelText());
+        if (messageTextHelper.hasWarning().get()) {
+            labelMessage.getStyleClass().setAll("warning-message");
+        } else {
+            labelMessage.getStyleClass().setAll("standard-message");
+        }
+        messageTextHelper.hasWarning().addListener((observable, oldValue, newValue) -> {
+            if (newValue)
+                labelMessage.getStyleClass().setAll("warning-message");
+            else
+                labelMessage.getStyleClass().setAll("standard-message");
+        });
+    }
+
+    private void configureDirectoryLabel() {
+        isModelDirectoryValid.addListener((v, o, n) -> updateModelDirectoryLabel());
+        modelDirectoryBinding.addListener((v, o, n) -> updateModelDirectoryLabel());
+        updateModelDirectoryLabel();
+    }
+
+    private void updateModelDirectoryLabel() {
+        if (isModelDirectoryValid.get()) {
+            modelDirLabel.getStyleClass().setAll("standard-message");
+            String modelPath = modelDirectoryBinding.get().toString();
+            modelDirLabel.setText(modelPath);
+            modelDirLabel.setCursor(Cursor.HAND);
+            tooltipModelDir.setText(resources.getString("ui.options.directory.tooltip"));
+            labelModelsLocation.setText(resources.getString("ui.options.directory-name"));
+        } else {
+            modelDirLabel.getStyleClass().setAll("warning-message");
+            modelDirLabel.setCursor(Cursor.DEFAULT);
+            modelDirLabel.setText(resources.getString("ui.options.directory-not-set"));
+            tooltipModelDir.setText(resources.getString("ui.options.directory-not-set.tooltip"));
+            labelModelsLocation.setText("");
+        }
+    }
+
+    @FXML
+    private void runInstanSeg() {
+        runInstanSeg(selectedModel.get());
+    }
+
+    private void runInstanSeg(InstanSegModel model) {
+        if (model == null) {
+            Dialogs.showErrorNotification(resources.getString("title"), resources.getString("ui.error.no-model"));
+            return;
+        }
+        var imageData = qupath.getImageData();
+        if (imageData == null) {
+            Dialogs.showErrorNotification(resources.getString("title"), resources.getString("error.no-imagedata"));
+            return;
+        }
+        if (!imageData.getServerMetadata().pixelSizeCalibrated()) {
+            Dialogs.showWarningNotification(resources.getString("title"), resources.getString("error.no-pixel-size"));
+        }
+
+        if (!PytorchManager.hasPyTorchEngine()) {
+            if (!Dialogs.showConfirmDialog(resources.getString("title"), resources.getString("ui.pytorch"))) {
+                Dialogs.showWarningNotification(resources.getString("title"), resources.getString("ui.pytorch-popup"));
+                return;
+            }
+        }
+
+        var modelPath = InstanSegUtils.getModelDirectory().orElse(null);
+        if (modelPath == null) {
+            Dialogs.showErrorNotification(resources.getString("title"), resources.getString("ui.model-directory.choose-prompt"));
+            return;
+        }
+
+        if (!model.isValid()) {
+            if (!Dialogs.showYesNoDialog(resources.getString("title"), resources.getString("ui.model-popup")))
+                return;
+            downloadModelAsync(model)
+                    .thenAccept((InstanSegModel suppliedModel) -> {
+                        if (suppliedModel == null || !suppliedModel.isValid()) {
+                            Dialogs.showErrorNotification(resources.getString("title"), String.format(resources.getString("error.localModel")));
+                        } else {
+                            runInstanSeg(suppliedModel);
+                        }
+                    });
+            return;
+        }
+
+        List<InputChannelItem> selectedChannels = comboInputChannels
+                .getCheckModel().getCheckedItems()
+                .stream()
+                .filter(Objects::nonNull)
+                .toList();
+        int imageChannels = selectedChannels.size();
+        var modelChannels = model.getNumChannels();
+        if (modelChannels.isEmpty()) {
+            Dialogs.showErrorNotification(resources.getString("title"), resources.getString("ui.error.model-not-downloaded"));
+            return;
+        }
+
+        int nModelChannels = modelChannels.get();
+        if (nModelChannels != InstanSegModel.ANY_CHANNELS && nModelChannels != imageChannels) {
+            Dialogs.showErrorNotification(resources.getString("title"), String.format(
+                    resources.getString("ui.error.num-channels-dont-match"),
+                    nModelChannels, imageChannels));
+            return;
+        }
+
+        // Create the tasks
+        var device = deviceChoices.getSelectionModel().getSelectedItem();
+        boolean makeMeasurements = makeMeasurementsCheckBox.isSelected();
+        boolean randomColors = randomColorsCheckBox.isSelected();
+
+        var task = new InstanSegTask(qupath.getImageData(), model, selectedChannels,
+                comboOutputChannels.getCheckModel().getCheckedIndices(), device,
+                makeMeasurements, randomColors, comboOutputType.getValue());
+
+        // Ensure PyTorch engine is available before running anything
+        CompletableFuture.supplyAsync(this::ensurePyTorchAvailable, ForkJoinPool.commonPool())
+                        .thenAccept((Boolean success) -> {
+                            if (success) {
+                                // Reset the pending task when it completes (either successfully or not)
+                                task.stateProperty().addListener((observable, oldValue, newValue) -> {
+                                    if (Set.of(Worker.State.CANCELLED, Worker.State.SUCCEEDED, Worker.State.FAILED).contains(newValue)) {
+                                        if (pendingTask.get() == task)
+                                            pendingTask.set(null);
+                                    }
+                                });
+                                // Setting the pending task prompts it to be run (so we need to do it after attaching
+                                // the listener, in case it ends really quickly)
+                                pendingTask.set(task);
+                            }
+                        });
+    }
+
+    private boolean ensurePyTorchAvailable() {
+        try {
+            FXUtils.runOnApplicationThread(() -> requestingPyTorch.set(true));
+            if (PytorchManager.hasPyTorchEngine()) {
+                return true;
+            } else {
+                downloadPyTorch();
+                return PytorchManager.hasPyTorchEngine();
+            }
+        } finally {
+            FXUtils.runOnApplicationThread(() -> requestingPyTorch.set(false));
+        }
+    }
+
+
+    private void downloadPyTorch() {
+        FXUtils.runOnApplicationThread(() -> Dialogs.showInfoNotification(resources.getString("title"), resources.getString("ui.pytorch-downloading")));
+        PytorchManager.getEngineOnline();
+        FXUtils.runOnApplicationThread(this::updateAvailableDevices);
+    }
+
+    @FXML
+    private void selectAllAnnotations() {
+        var hierarchy = qupath.getImageData().getHierarchy();
+        hierarchy.getSelectionModel().setSelectedObjects(hierarchy.getAnnotationObjects(), null);
+        var step = new DefaultScriptableWorkflowStep("Select all annotations", "selectAnnotations()");
+        qupath.imageDataProperty().get().getHistoryWorkflow().addStep(step);
+    }
+
+    @FXML
+    private void selectAllTMACores() {
+        var hierarchy = qupath.getImageData().getHierarchy();
+        hierarchy.getSelectionModel().setSelectedObjects(PathObjectTools.getTMACoreObjects(hierarchy, false),null);
+        var step = new DefaultScriptableWorkflowStep("Select all TMA cores", "selectTMACores()");
+        qupath.imageDataProperty().get().getHistoryWorkflow().addStep(step);
+    }
+
+    private void promptToUpdateDirectory(StringProperty dirPath) {
+        var modelDirPath = dirPath.get();
+        var dir = modelDirPath == null || modelDirPath.isEmpty() ? null : new File(modelDirPath);
+        if (dir != null) {
+            if (dir.isFile())
+                dir = dir.getParentFile();
+            else if (!dir.exists())
+                dir = null;
+        }
+        var newDir = FileChoosers.promptForDirectory(
+                FXUtils.getWindow(modelDirLabel), // Get window from any node here
+                resources.getString("ui.model-directory.choose-directory"),
+                dir);
+        if (newDir == null)
+            return;
+        dirPath.set(newDir.getAbsolutePath());
+    }
+
+}
