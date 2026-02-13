@@ -13,7 +13,7 @@ As the name implies, SignalFinder is a tool for finding signal (thresholding) in
 SignalFinder works through the use of image texture analysis theory, relying patterns in the statistical variation of small regions of image in common between background regions of different IF images. 
 Notably, while mean, median, and standard deviation may vary in background regions between images, coeffecient of variation (CV) is consistent.
 
-The SignalFinder Extension is based off of the SFT algortihm (doi.org/10.1021/acs.analchem.5b03159)
+The SignalFinder Extension is based off of the SFT algorithm (doi.org/10.1021/acs.analchem.5b03159)
 
 Unlike the original SFT algorithm, however, the SignalFinder extension does not using a sliding window analysis to sample the image statistics. Rather, it uses the cell measurements(mean, sd, median) from cell compartments (Nucleus, Cytoplasm, and Membrane) to sample the image statistics. This approach has been validated to give results with a high degree of agreement with the original algorithm. Also compared to the standalone SignalFinder software, this extension runs much faster, taking less than a minute to threshold 30 channels for a million-cell dataset and less than hour if calculating cell measurements for the same.
 
