@@ -35,4 +35,6 @@ To run simply select "Extensions">"SignalFinder">"Run SignalFinder"
 <h1>How to cite?</h1>
 This is the pre-release form of SignalFinder, we're actively working on publication
 
+
 CC BY-NC-4.0
+Contact Van Andel Intitute for commercial licensing options.
