@@ -1,5 +1,5 @@
 <h1>SignalFinder QuPath Extension</h1>
-<h2>Developers: Shashvat Shah; Zachary Klamer</h2>
+<h3>Developers: Shashvat Shah; Zachary Klamer</h3>
 
 This is the compiled form of the SignalFinder Extension for QuPath. 
 
@@ -33,8 +33,8 @@ The SignalFinder extension assumes that you have cell detections with mean, medi
 To run simply select "Extensions">"SignalFinder">"Run SignalFinder"
 
 <h1>How to cite?</h1>
-This is the pre-release form of SignalFinder, we're actively working on publication
-
+This is the pre-release form of SignalFinder, we're actively working on publication. In the meantime, cite the original SFT algorithm and this GitHub (doi.org/10.1021/acs.analchem.5b03159).
+<br><br><br>
 
 CC BY-NC-4.0
 Contact Van Andel Intitute for commercial licensing options.
